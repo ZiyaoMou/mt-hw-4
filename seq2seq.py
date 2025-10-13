@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from nltk.translate.bleu_score import corpus_bleu
 from torch import optim
+import os
 
 
 logging.basicConfig(level=logging.DEBUG,
@@ -47,6 +48,23 @@ SOS_index = 0
 EOS_index = 1
 MAX_LENGTH = 15
 
+class GRUCellManual(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.W_z = nn.Linear(input_size, hidden_size, bias=True)
+        self.U_z = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.W_r = nn.Linear(input_size, hidden_size, bias=True)
+        self.U_r = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.W_h = nn.Linear(input_size, hidden_size, bias=True)
+        self.U_h = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x, h_prev):
+        z = torch.sigmoid(self.W_z(x) + self.U_z(h_prev))
+        r = torch.sigmoid(self.W_r(x) + self.U_r(h_prev))
+        h_tilde = torch.tanh(self.W_h(x) + self.U_h(r * h_prev))
+        h = (1 - z) * h_prev + z * h_tilde
+        return h
 
 class Vocab:
     """ This class handles the mapping between the words and their indicies
@@ -147,18 +165,22 @@ class EncoderRNN(nn.Module):
         See, for example, https://en.wikipedia.org/wiki/Long_short-term_memory#LSTM_with_a_forget_gate
         You should make your LSTM modular and re-use it in the Decoder.
         """
-        "*** YOUR CODE HERE ***"
-        raise NotImplementedError
-        return output, hidden
+        super(EncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(input_size, hidden_size)
+        self.cell = GRUCellManual(hidden_size, hidden_size)
+
 
 
     def forward(self, input, hidden):
         """runs the forward pass of the encoder
         returns the output and the hidden state
         """
-        "*** YOUR CODE HERE ***"
-        raise NotImplementedError
-        return output, hidden
+        embedded = self.embedding(input).view(1, 1, -1)   # (1,1,H)
+        h_prev = hidden.view(1, -1)                       # (1,H)
+        h_new  = self.cell(embedded.view(1, -1), h_prev)  # (1,H)
+        h_new  = h_new.view(1, 1, -1)
+        return h_new, h_new
 
     def get_initial_hidden_state(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
@@ -174,25 +196,49 @@ class AttnDecoderRNN(nn.Module):
         self.dropout_p = dropout_p
         self.max_length = max_length
 
+        self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(self.dropout_p)
-        
-        """Initilize your word embedding, decoder LSTM, and weights needed for your attention here
-        """
-        "*** YOUR CODE HERE ***"
-        raise NotImplementedError
 
+        # Bahdanau-style attention pieces
+        self.Wa = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.Ua = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.va = nn.Linear(hidden_size, 1, bias=False)
+
+        # Combine [emb, context] before the GRU cell
+        self.in_proj = nn.Linear(hidden_size * 2, hidden_size, bias=True)
+        self.cell = GRUCellManual(hidden_size, hidden_size)
+
+        # NEW: project [h_new, context] (size 2*H) back to H
+        self.readout = nn.Linear(hidden_size * 2, hidden_size)
+
+        # Final classifier: H -> vocab
         self.out = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, input, hidden, encoder_outputs):
-        """runs the forward pass of the decoder
-        returns the log_softmax, hidden state, and attn_weights
-        
-        Dropout (self.dropout) should be applied to the word embeddings.
-        """
-        
-        "*** YOUR CODE HERE ***"
-        raise NotImplementedError
-        return log_softmax, hidden, attn_weights
+        emb = self.embedding(input).view(1, -1)
+        emb = self.dropout(emb)
+
+        T = encoder_outputs.size(0)
+        h_prev = hidden.view(1, -1)
+
+        Wa_s = self.Wa(h_prev).expand(T, -1)      # (T,H)
+        Ua_h = self.Ua(encoder_outputs)           # (T,H)
+        e_ij = self.va(torch.tanh(Wa_s + Ua_h))   # (T,1)
+        attn_weights = F.softmax(e_ij.squeeze(1), dim=0).unsqueeze(0)  # (1,T)
+
+        context = torch.mm(attn_weights, encoder_outputs)              # (1,H)
+        dec_in = torch.cat([emb, context], dim=1)                      # (1,2H)
+        dec_in = torch.tanh(self.in_proj(dec_in))                      # (1,H)
+
+        h_new = self.cell(dec_in, h_prev).view(1, 1, -1)               # (1,1,H)
+
+        # FIX: project 2H -> H before vocab projection
+        readout = torch.cat([h_new.view(1, -1), context], dim=1)       # (1,2H)
+        readout = torch.tanh(self.readout(readout))                    # (1,H)
+
+        logits = self.out(readout)                                     # (1,V)
+        log_softmax = F.log_softmax(logits, dim=1)
+        return log_softmax, h_new, attn_weights
 
     def get_initial_hidden_state(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
@@ -207,11 +253,50 @@ def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, m
     encoder.train()
     decoder.train()
 
-    "*** YOUR CODE HERE ***"
-    raise NotImplementedError
+    optimizer.zero_grad()
 
-    return loss.item() 
+    input_length = input_tensor.size(0)
+    target_length = target_tensor.size(0)
 
+    # 缓存 encoder 输出以供注意力使用
+    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
+
+    loss = 0.0
+
+    for ei in range(input_length):
+        encoder_output, encoder_hidden = encoder(input_tensor[ei], encoder_hidden)
+        encoder_outputs[ei] = encoder_output[0, 0]
+
+    decoder_input = torch.tensor([[SOS_index]], device=device)
+    decoder_hidden = encoder_hidden
+
+    teacher_forcing_ratio = 0.5
+    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
+    enc_valid = encoder_outputs[:target_length, :]
+
+    if use_teacher_forcing:
+        for di in range(target_length):
+            decoder_output, decoder_hidden, decoder_attention = decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            loss += criterion(decoder_output, target_tensor[di])
+            decoder_input = target_tensor[di].view(1, 1)  # gold
+    else:
+        for di in range(target_length):
+            decoder_output, decoder_hidden, decoder_attention = decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            loss += criterion(decoder_output, target_tensor[di])
+            topv, topi = decoder_output.data.topk(1)
+            decoder_input = topi.detach().view(1, 1)
+            if decoder_input.item() == EOS_index:
+                break
+
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()), max_norm=5.0)
+
+    optimizer.step()
+
+    return loss.item() / max(1, target_length)
 
 
 ######################################################################
@@ -291,14 +376,23 @@ def translate_random_sentence(encoder, decoder, pairs, src_vocab, tgt_vocab, n=1
 ######################################################################
 
 def show_attention(input_sentence, output_words, attentions):
-    """visualize the attention mechanism. And save it to a file. 
-    Plots should look roughly like this: https://i.stack.imgur.com/PhtQi.png
-    You plots should include axis labels and a legend.
-    you may want to use matplotlib.
-    """
-    
-    "*** YOUR CODE HERE ***"
-    raise NotImplementedError
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111)
+
+    cax = ax.imshow(attentions.numpy(), interpolation='nearest', aspect='auto')
+    ax.set_title(f'Attention heatmap(input_sentence: {input_sentence}, output_words: {output_words})')
+    fig.colorbar(cax)
+    ax.set_xticks(range(len(input_sentence.split(' '))))
+    ax.set_yticks(range(len(output_words)))
+    ax.set_xticklabels(input_sentence.split(' '), rotation=90)
+    ax.set_yticklabels(output_words)
+
+    ax.set_xlabel('Input (source)')
+    ax.set_ylabel('Output (target)')
+    plt.tight_layout()
+    plt.show()
+    os.makedirs('figures', exist_ok=True)
+    plt.savefig(f'figures/attention-{input_sentence}.png')
 
 
 def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab):
@@ -329,7 +423,7 @@ def main():
                     help='print loss info every this many training examples')
     ap.add_argument('--checkpoint_every', default=10000, type=int,
                     help='write out checkpoint every this many training examples')
-    ap.add_argument('--initial_learning_rate', default=0.001, type=int,
+    ap.add_argument('--initial_learning_rate', default=0.0005, type=int,
                     help='initial learning rate')
     ap.add_argument('--src_lang', default='fr',
                     help='Source (input) language code, e.g. "fr"')
@@ -345,7 +439,7 @@ def main():
                     help='test file. each line should have a source sentence,' +
                          'followed by "|||", followed by a target sentence' +
                          ' (for test, target is ignored)')
-    ap.add_argument('--out_file', default='out.txt',
+    ap.add_argument('--out_file', default=f'out_1024.txt',
                     help='output file for test translations')
     ap.add_argument('--load_checkpoint', nargs=1,
                     help='checkpoint file to start from')
@@ -411,7 +505,7 @@ def main():
                      'src_vocab': src_vocab,
                      'tgt_vocab': tgt_vocab,
                      }
-            filename = 'state_%010d.pt' % iter_num
+            filename = f'hidden_size_{args.hidden_size}_state_%010d.pt' % iter_num
             torch.save(state, filename)
             logging.debug('wrote checkpoint to %s', filename)
 

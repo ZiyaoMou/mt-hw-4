@@ -1,0 +1,3 @@
+*.pt
+slurm_output/
+*.slurm
