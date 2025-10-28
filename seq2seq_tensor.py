@@ -156,6 +156,39 @@ class BahdanauAttention(nn.Module):
         context = torch.bmm(attn.unsqueeze(1), enc_out).squeeze(1)  # [B,H]
         return context, attn
 
+class LuongAttention(nn.Module):
+    """
+    Luong global attention (dot/general):
+      score(h_t, h_s) = h_t^T h_s        # dot
+      score(h_t, h_s) = h_t^T W_a h_s    # general
+    """
+    def __init__(self, hidden_size, method: str = "dot"):
+        super().__init__()
+        assert method in ("dot", "general")
+        self.method = method
+        if method == "general":
+            self.Wa = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, h_t: torch.Tensor, enc_out: torch.Tensor, src_mask: torch.Tensor):
+        """
+        h_t: [B, H]       (current decoder hidden)
+        enc_out: [B, T, H]  (encoder outputs)
+        src_mask: [B, T]  (True for real tokens)
+        returns: context [B,H], attn_weights [B,T]
+        """
+        if self.method == "dot":
+            # scores: [B, T] = enc_out @ h_t
+            scores = torch.bmm(enc_out, h_t.unsqueeze(2)).squeeze(2)
+        else:  # general
+            # scores: [B, T] = (W_a enc_out) @ h_t
+            proj = self.Wa(enc_out)                       # [B,T,H]
+            scores = torch.bmm(proj, h_t.unsqueeze(2)).squeeze(2)
+
+        scores = scores.masked_fill(~src_mask, float('-inf'))
+        attn = F.softmax(scores, dim=1)                   # [B,T]
+        context = torch.bmm(attn.unsqueeze(1), enc_out).squeeze(1)  # [B,H]
+        return context, attn
+
 class AttnDecoderLSTM(nn.Module):
     def __init__(self, hidden_size, output_size, dropout_p=0.1):
         super().__init__()
@@ -163,7 +196,8 @@ class AttnDecoderLSTM(nn.Module):
         self.output_size = output_size
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_index)
         self.dropout = nn.Dropout(dropout_p)
-        self.attn = BahdanauAttention(hidden_size)
+        # self.attn = BahdanauAttention(hidden_size)
+        self.attn = LuongAttention(hidden_size)
         self.lstm_cell = nn.LSTMCell(hidden_size, hidden_size)  # input will be pre-projected [emb+ctx]->H
         self.in_proj = nn.Linear(hidden_size * 2, hidden_size)
         self.readout = nn.Linear(hidden_size * 2, hidden_size)
@@ -247,8 +281,8 @@ def show_attention(*args, **kwargs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--hidden_size', default=256, type=int)
-    ap.add_argument('--n_iters', default=100000, type=int)
+    ap.add_argument('--hidden_size', default=1024, type=int)
+    ap.add_argument('--n_iters', default=160010, type=int)
     ap.add_argument('--print_every', default=5000, type=int)
     ap.add_argument('--checkpoint_every', default=10000, type=int)
     ap.add_argument('--initial_learning_rate', default=0.0005, type=float)
