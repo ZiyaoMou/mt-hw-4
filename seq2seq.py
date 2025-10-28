@@ -258,7 +258,6 @@ def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, m
     input_length = input_tensor.size(0)
     target_length = target_tensor.size(0)
 
-    # 缓存 encoder 输出以供注意力使用
     encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
 
     loss = 0.0
@@ -380,7 +379,7 @@ def show_attention(input_sentence, output_words, attentions):
     ax = fig.add_subplot(111)
 
     cax = ax.imshow(attentions.numpy(), interpolation='nearest', aspect='auto')
-    ax.set_title(f'Attention heatmap(input_sentence: {input_sentence}, output_words: {output_words})')
+    ax.set_title(f'Attention heatmap')
     fig.colorbar(cax)
     ax.set_xticks(range(len(input_sentence.split(' '))))
     ax.set_yticks(range(len(output_words)))
